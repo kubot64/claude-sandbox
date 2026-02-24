@@ -4,6 +4,8 @@
 
 set -euo pipefail
 
+warn() { echo -e "\033[33m[警告]\033[0m $*" >&2; }
+
 export PROFILE="${PROFILE:-node}"
 export DISABLE_FIREWALL="${DISABLE_FIREWALL:-false}"
 CUSTOM_ALLOWLIST_FILE="/home/claude/.allowlist"

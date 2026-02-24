@@ -282,7 +282,9 @@ acquire_lock() {
 }
 
 release_lock() {
-    [[ -n "$LOCK_DIR" ]] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+    if [[ -n "$LOCK_DIR" ]]; then
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
+    fi
 }
 
 # ================================================================
@@ -422,7 +424,7 @@ EOF
     check_deps
 
     local slug
-    slug=$(make_slug)
+    slug=$(make_slug "$PWD")
     local project_dir
     project_dir=$(init_dirs "$slug")
 
