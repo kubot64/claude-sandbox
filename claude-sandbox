@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+# claude-sandbox
+# Claude Code を Docker (Colima) + 1Password CLI でセキュアに実行するツール
+
+set -euo pipefail
+
+# ================================================================
+# 定数
+# ================================================================
+
+SANDBOX_DIR="$HOME/.claude-sandbox"
+SHARED_DIR="$SANDBOX_DIR/shared"
+PROJECTS_DIR="$SANDBOX_DIR/projects"
+IMAGE_NAME="claude-sandbox"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ================================================================
+# ユーティリティ
+# ================================================================
+
+err()  { echo -e "\033[31m[エラー]\033[0m $*" >&2; }
+warn() { echo -e "\033[33m[警告]\033[0m $*" >&2; }
+info() { echo -e "\033[32m[情報]\033[0m $*" >&2; }
+
+# ================================================================
+# Colima 自動検出
+# ================================================================
+
+setup_docker_host() {
+    # 1. 既存の DOCKER_HOST があればそのまま使う
+    if [[ -n "${DOCKER_HOST:-}" ]]; then
+        return
+    fi
+
+    # 2. 現在の docker context で接続できるか確認
+    if docker info &>/dev/null 2>&1; then
+        return
+    fi
+
+    # 3. Colima を試みる
+    local colima_profile="${COLIMA_PROFILE:-default}"
+    local colima_sock="$HOME/.colima/$colima_profile/docker.sock"
+
+    if command -v colima &>/dev/null \
+        && colima status "$colima_profile" &>/dev/null \
+        && [[ -S "$colima_sock" ]]; then
+        export DOCKER_HOST="unix://$colima_sock"
+        # 接続テスト
+        if ! docker info &>/dev/null 2>&1; then
+            err "Colima は動いていますが Docker に接続できません"
+            err "  colima stop && colima start を試してください"
+            exit 1
+        fi
+        return
+    fi
+
+    err "Docker に接続できません"
+    err "  Colima を起動してください: colima start"
+    exit 1
+}
+
+# ================================================================
+# 依存確認
+# ================================================================
+
+check_deps() {
+    local missing=()
+    for cmd in docker op jq rsync; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        err "必要なコマンドが見つかりません: ${missing[*]}"
+        err "  brew install docker 1password-cli jq rsync"
+        exit 1
+    fi
+
+    if ! op account list &>/dev/null 2>&1; then
+        err "1Password にサインインしていません"
+        err "  op signin を実行してください"
+        exit 1
+    fi
+}
+
+# ================================================================
+# doctor サブコマンド
+# ================================================================
+
+cmd_doctor() {
+    local ok="\033[32m[✓]\033[0m"
+    local ng="\033[31m[✗]\033[0m"
+
+    echo "=== claude-sandbox doctor ==="
+    echo ""
+
+    # colima
+    if command -v colima &>/dev/null; then
+        local ver; ver=$(colima version 2>/dev/null | head -1 || echo "unknown")
+        echo -e "$ok colima: installed ($ver)"
+        local profile="${COLIMA_PROFILE:-default}"
+        if colima status "$profile" &>/dev/null; then
+            echo -e "$ok colima: running (profile: $profile)"
+        else
+            echo -e "$ng colima: NOT running"
+            echo -e "     → colima start"
+        fi
+    else
+        echo -e "$ng colima: NOT installed"
+        echo -e "     → brew install colima"
+    fi
+
+    # docker
+    setup_docker_host 2>/dev/null || true
+    if docker info &>/dev/null 2>&1; then
+        echo -e "$ok docker: connected"
+    else
+        echo -e "$ng docker: cannot connect"
+    fi
+
+    # 1password cli
+    if command -v op &>/dev/null; then
+        local op_ver; op_ver=$(op --version 2>/dev/null || echo "unknown")
+        echo -e "$ok op: installed ($op_ver)"
+        if op account list &>/dev/null 2>&1; then
+            local email; email=$(op account list --format json 2>/dev/null | jq -r '.[0].email' 2>/dev/null || echo "unknown")
+            echo -e "$ok op: signed in ($email)"
+        else
+            echo -e "$ng op: NOT signed in"
+            echo -e "     → op signin"
+        fi
+    else
+        echo -e "$ng op: NOT installed"
+        echo -e "     → brew install 1password-cli"
+    fi
+
+    # 1Password アイテム確認
+    echo ""
+    echo "--- 1Password アイテム ---"
+    for item in "Claude Code" "SSH Key" "Anthropic"; do
+        if op item get "$item" &>/dev/null 2>&1; then
+            echo -e "$ok 1Password item \"$item\": found"
+        else
+            echo -e "$ng 1Password item \"$item\": NOT FOUND"
+            case "$item" in
+                "Claude Code")
+                    echo -e "     → 初回起動後に自動作成されます"
+                    ;;
+                "SSH Key")
+                    echo -e "     → op item create --category=login --title=\"SSH Key\" --field=\"private key\"=\$(cat ~/.ssh/id_rsa)"
+                    ;;
+                "Anthropic")
+                    echo -e "     → op item create --category=login --title=\"Anthropic\" --field=api_key=<your_key>"
+                    ;;
+            esac
+        fi
+    done
+
+    echo ""
+}
+
+# ================================================================
+# プロジェクトスラグ生成
+# ================================================================
+
+make_slug() {
+    local dir="${1:-$PWD}"   # テストで上書き可能にする
+    local canonical
+    canonical="$(realpath "$dir")"
+    local hash
+    hash="$(echo "$canonical" | sha1sum | head -c 12)"
+    echo "$(basename "$canonical")_${hash}"
+}
+
+# ================================================================
+# プロファイル解決（テスト可能な純粋関数）
+# ================================================================
+
+# resolve_profile <explicit:true|false> <profile> <profile_file>
+# → 最終的なプロファイル名を stdout に出力
+resolve_profile() {
+    local explicit="$1"
+    local profile="$2"
+    local profile_file="$3"
+
+    if [[ "$explicit" == "false" ]] && [[ -f "$profile_file" ]]; then
+        cat "$profile_file"
+    else
+        echo "$profile"
+    fi
+}
+
+# ================================================================
+# ディレクトリ初期化
+# ================================================================
+
+init_dirs() {
+    local slug="$1"
+    local project_dir="$PROJECTS_DIR/$slug"
+
+    mkdir -p "$SHARED_DIR/.claude"
+    mkdir -p "$project_dir/history"
+
+    # allowlist がなければ空ファイルを作成
+    if [[ ! -f "$project_dir/allowlist" ]]; then
+        cat > "$project_dir/allowlist" <<'EOF'
+# プロジェクト別の追加許可ホスト名（1行1ホスト名）
+# 例:
+# api.example.com
+EOF
+    fi
+
+    # プロファイル記録
+    if [[ ! -f "$project_dir/profile" ]]; then
+        echo "$PROFILE" > "$project_dir/profile"
+    fi
+
+    echo "$project_dir"
+}
+
+# ================================================================
+# 設定同期（ホストの ~/.claude → shared/.claude）
+# ================================================================
+
+sync_claude_config() {
+    local src="$HOME/.claude"
+    local dst="$SHARED_DIR/.claude"
+
+    if [[ -d "$src" ]]; then
+        rsync -u \
+            --include="settings.json" \
+            --include="CLAUDE.md" \
+            --exclude="*" \
+            "$src/" "$dst/" 2>/dev/null || true
+    fi
+}
+
+# ================================================================
+# Docker イメージビルド
+# ================================================================
+
+build_image() {
+    local force="${1:-false}"
+
+    if [[ "$force" == "true" ]] || ! docker image inspect "$IMAGE_NAME" &>/dev/null 2>&1; then
+        info "Docker イメージをビルド中..."
+        docker build -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    fi
+}
+
+# ================================================================
+# ロック管理
+# ================================================================
+
+LOCK_DIR=""
+LOCK_PID_FILE=""
+
+acquire_lock() {
+    local project_dir="$1"
+    LOCK_DIR="$project_dir/.lock"
+    LOCK_PID_FILE="$LOCK_DIR/pid"
+
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo $$ > "$LOCK_PID_FILE"
+        return 0
+    fi
+
+    # stale lock チェック
+    local old_pid
+    old_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null || echo "")
+
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+        warn "別のセッションが実行中です (PID: $old_pid)"
+        warn "並列実行は非対応です"
+        warn "  強制起動する場合: claude-sandbox --force"
+        exit 1
+    else
+        warn "stale lock を検出しました (PID: ${old_pid:-不明})。回収します。"
+        rm -rf "$LOCK_DIR"
+        mkdir "$LOCK_DIR"
+        echo $$ > "$LOCK_PID_FILE"
+    fi
+}
+
+release_lock() {
+    [[ -n "$LOCK_DIR" ]] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+}
+
+# ================================================================
+# 1Password から認証情報を取得
+# ================================================================
+
+fetch_secrets() {
+    local claude_json=""
+    local ssh_key=""
+
+    # Claude 認証トークン
+    claude_json=$(op read "op://Personal/Claude Code/credential" 2>/dev/null || echo "")
+    if [[ -z "$claude_json" ]]; then
+        info "1Password に Claude 認証トークンが見つかりません（初回起動時は正常）"
+    fi
+
+    # SSH 鍵
+    ssh_key=$(op read "op://Personal/SSH Key/private key" 2>/dev/null || echo "")
+    if [[ -z "$ssh_key" ]]; then
+        info "1Password に SSH 鍵が見つかりません（SSH 操作は利用不可）"
+    fi
+
+    CLAUDE_JSON="$claude_json"
+    SSH_KEY="$ssh_key"
+}
+
+# ================================================================
+# .claude.json を 1Password に保存
+# ================================================================
+
+save_claude_token() {
+    local token_file="$1"   # コンテナが書き出したファイル（ホスト側マウントパス）
+    local initial_json="$2"
+
+    # ファイルが存在しない or 空（初回未ログイン等）はスキップ
+    [[ ! -s "$token_file" ]] && return
+
+    local current_json
+    current_json=$(cat "$token_file")
+
+    # JSON バリデーション
+    if ! echo "$current_json" | jq . &>/dev/null 2>&1; then
+        warn ".claude.json が不正な JSON です。1Password への保存をスキップします"
+        rm -f "$token_file"
+        return
+    fi
+
+    # 変化がなければスキップ
+    if [[ "$current_json" == "$initial_json" ]]; then
+        rm -f "$token_file"
+        return
+    fi
+
+    info "1Password に Claude 認証トークンを保存中..."
+
+    if op item get "Claude Code" &>/dev/null 2>&1; then
+        op item edit "Claude Code" "credential=$current_json" &>/dev/null && \
+            info "1Password を更新しました"
+    else
+        op item create \
+            --category=login \
+            --title="Claude Code" \
+            "credential=$current_json" &>/dev/null && \
+            info "1Password に新規保存しました"
+    fi
+
+    rm -f "$token_file" 2>/dev/null || true
+}
+
+# ================================================================
+# メイン処理
+# ================================================================
+
+main() {
+    # デフォルト値
+    PROFILE="node"
+    PROFILE_EXPLICIT="false"   # --profile が明示指定されたか
+    DISABLE_FIREWALL="false"
+    REBUILD="false"
+    FORCE="false"
+
+    # 引数パース
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            doctor)
+                setup_docker_host 2>/dev/null || true  # 失敗しても診断は続ける
+                cmd_doctor
+                exit 0
+                ;;
+            --profile)
+                shift
+                PROFILE="${1:-node}"
+                PROFILE_EXPLICIT="true"
+                case "$PROFILE" in
+                    node|python|go|rust) ;;
+                    *) err "不明なプロファイル: $PROFILE (node|python|go|rust)"; exit 1 ;;
+                esac
+                ;;
+            --no-firewall-i-know-what-im-doing)
+                DISABLE_FIREWALL="true"
+                ;;
+            --rebuild)
+                REBUILD="true"
+                ;;
+            --force)
+                FORCE="true"
+                ;;
+            --help|-h)
+                cat <<'EOF'
+使い方: claude-sandbox [オプション] [-- claude のオプション]
+
+オプション:
+  --profile <node|python|go|rust>   言語プロファイル（デフォルト: node）
+  --rebuild                          Docker イメージを強制再ビルド
+  --force                            stale lock を無視して起動
+  --no-firewall-i-know-what-im-doing ファイアウォールを無効化（危険）
+  doctor                             依存関係・設定を診断
+
+環境変数:
+  COLIMA_PROFILE   Colima プロファイル名（デフォルト: default）
+EOF
+                exit 0
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                break
+                ;;
+        esac
+        shift
+    done
+
+    # 初期化
+    setup_docker_host
+    check_deps
+
+    local slug
+    slug=$(make_slug)
+    local project_dir
+    project_dir=$(init_dirs "$slug")
+
+    # プロファイル決定: 明示指定 > 保存済み > デフォルト(node)
+    PROFILE=$(resolve_profile "$PROFILE_EXPLICIT" "$PROFILE" "$project_dir/profile")
+    echo "$PROFILE" > "$project_dir/profile"
+
+    sync_claude_config
+    build_image "$REBUILD"
+
+    # ロック取得
+    if [[ "$FORCE" == "true" ]]; then
+        rm -rf "$project_dir/.lock" 2>/dev/null || true
+    fi
+    acquire_lock "$project_dir"
+    trap 'release_lock' EXIT
+
+    # 1Password から認証情報取得
+    info "1Password から認証情報を取得中..."
+    CLAUDE_JSON=""
+    SSH_KEY=""
+    fetch_secrets
+    local initial_json="$CLAUDE_JSON"
+
+    # .claude.json write-back 用: ホスト側に空ファイルを作りコンテナにマウント
+    # entrypoint.sh はセッション終了時にここへ書き出す
+    local token_out="$project_dir/.claude.json.out"
+    rm -f "$token_out"
+    touch "$token_out"
+
+    # docker run 引数を組み立て
+    local docker_args=(
+        run --rm -it
+        --sysctl net.ipv6.conf.all.disable_ipv6=1
+        --cap-add NET_ADMIN
+        # SSH_KEY が設定されている場合、entrypoint.sh は mount -t tmpfs を実行するため
+        # SYS_ADMIN が必要（SSH 鍵を tmpfs に隔離するセキュリティ機能）
+    )
+    if [[ -n "$SSH_KEY" ]]; then
+        docker_args+=(--cap-add SYS_ADMIN)
+    fi
+    docker_args+=(
+        -e "PROFILE=$PROFILE"
+        -e "DISABLE_FIREWALL=$DISABLE_FIREWALL"
+        -e "CLAUDE_JSON=$CLAUDE_JSON"
+        -e "SSH_KEY=$SSH_KEY"
+        # ANTHROPIC_API_KEY は op run がホスト env に設定済み → コンテナへ転送
+        -e "ANTHROPIC_API_KEY"
+        # Named volume: Claude Code 本体を永続化
+        -v "claude-sandbox-${slug}:/home/claude/.local"
+        # 共有設定
+        -v "${SHARED_DIR}/.claude:/home/claude/.claude"
+        # プロジェクト別履歴
+        -v "${project_dir}/history:/home/claude/.claude/projects"
+        # allowlist（読み取り専用）
+        -v "${project_dir}/allowlist:/home/claude/.allowlist:ro"
+        # .claude.json write-back 用出力ファイル
+        -v "${token_out}:/home/claude/.claude.json.out"
+        # git 設定
+        -v "${HOME}/.gitconfig:/home/claude/.gitconfig:ro"
+        # 作業ディレクトリ
+        -v "$(pwd):/workspace"
+        -w /workspace
+        "$IMAGE_NAME"
+        claude "$@"
+    )
+
+    info "プロジェクト: $(basename "$PWD") [slug: $slug]"
+    info "プロファイル: $PROFILE"
+
+    # op run で ANTHROPIC_API_KEY を注入して docker run 実行
+    # API キーが 1Password にない場合は op run をスキップ
+    local run_exit=0
+    if op item get "Anthropic" &>/dev/null 2>&1; then
+        op run \
+            --env="ANTHROPIC_API_KEY=op://Personal/Anthropic/api_key" \
+            -- docker "${docker_args[@]}" || run_exit=$?
+    else
+        docker "${docker_args[@]}" || run_exit=$?
+    fi
+
+    # コンテナ終了後: .claude.json を 1Password に保存
+    save_claude_token "$token_out" "$initial_json"
+
+    if [[ $run_exit -ne 0 ]]; then
+        err "コンテナが異常終了しました (exit: $run_exit)"
+    fi
+    info "セッション終了"
+    return $run_exit
+}
+
+# bats 等でソースされた場合は main を実行しない
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

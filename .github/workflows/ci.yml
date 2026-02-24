@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # ----------------------------------------------------------------
+  # Job 1: shellcheck + bats 単体テスト（Docker 不要）
+  # ----------------------------------------------------------------
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get install -y shellcheck bats
+
+      - name: Run shellcheck + unit tests
+        run: bash tests/run_all.sh --unit-only
+
+  # ----------------------------------------------------------------
+  # Job 2: Docker 統合テスト（PR 時 + main push 時に実行）
+  # ----------------------------------------------------------------
+  integration:
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get install -y shellcheck bats
+
+      - name: Build Docker image
+        run: docker build -t claude-sandbox .
+
+      - name: Run integration tests
+        # NET_ADMIN は GitHub Actions 標準ランナーで利用可能
+        # ssh_tmpfs テストは --privileged を使用（ubuntu-latest ランナーで動作確認済み）
+        run: bash tests/run_all.sh --integration

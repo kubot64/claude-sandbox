@@ -1,0 +1,24 @@
+# tinyproxy 設定テンプレート
+# init-network.sh が ALLOWED_HOSTS を展開して /etc/tinyproxy/tinyproxy.conf に書き出す
+
+Port 8888
+Listen 127.0.0.1
+Timeout 600
+LogLevel Error
+LogFile "/tmp/tinyproxy.log"
+PidFile "/tmp/tinyproxy.pid"
+
+# CONNECT トンネリングを許可（HTTPS用）
+# デフォルトで 443 のみ許可
+ConnectPort 443
+ConnectPort 80
+
+# ループバックからのアクセスのみ許可
+Allow 127.0.0.1
+
+# 許可ホスト名リスト（init-network.sh が以下に追記する）
+# Filter /etc/tinyproxy/filter
+# FilterURLs On
+# FilterCaseSensitive Off
+# FilterDefaultDeny Yes
+{{FILTER_SECTION}}

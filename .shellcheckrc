@@ -1,0 +1,10 @@
+# shellcheck 設定
+# https://www.shellcheck.net/wiki/
+
+# bash を対象言語とする
+shell=bash
+
+# 外部ファイルを source する際の警告を抑制（テストヘルパー等）
+# SC1090: Can't follow non-constant source
+# SC1091: Not following sourced file
+disable=SC1090,SC1091
